@@ -5241,6 +5241,16 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.group  = FIO_OPT_G_RUNTIME,
 	},
 	{
+                .name   = "compress_test",
+                .lname  = "Compression Test Enable",
+                .type   = FIO_OPT_BOOL,
+                .off1   = offsetof(struct thread_options, compress_test),
+                .help   = "Compression Performance Test",
+                .def    = "0",
+                .category = FIO_OPT_C_IO,
+                .group  = FIO_OPT_G_IO_TYPE,
+        },
+	{
 		.name = NULL,
 	},
 };

@@ -391,6 +391,8 @@ struct thread_options {
 	unsigned int fdp_plis[FIO_MAX_PLIS];
 	unsigned int fdp_nrpli;
 
+	unsigned int compress_test;
+
 	unsigned int log_entries;
 	unsigned int log_prio;
 };
@@ -705,6 +707,8 @@ struct thread_options_pack {
 	uint32_t fdp;
 	uint32_t fdp_plis[FIO_MAX_PLIS];
 	uint32_t fdp_nrpli;
+
+	uint32_t compress_test;
 
 	/*
 	 * verify_pattern followed by buffer_pattern from the unpacked struct

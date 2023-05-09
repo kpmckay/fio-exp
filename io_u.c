@@ -11,6 +11,7 @@
 #include "lib/pow2.h"
 #include "minmax.h"
 #include "zbd.h"
+#include "lz4.h"
 
 struct io_completion_data {
 	int nr;				/* input */
@@ -1761,6 +1762,49 @@ static void small_content_scramble(struct io_u *io_u)
 	}
 }
 
+void do_compress_lz(struct io_u *io_u, unsigned long long min_write)
+{
+    int lz4_bytes;
+    char* scratchbuf = calloc(io_u->buflen, sizeof(char));
+
+    if (scratchbuf) {
+        lz4_bytes = LZ4_compress_default(io_u->buf, scratchbuf, io_u->buflen, io_u->buflen);
+        lz4_bytes = ((lz4_bytes + 4096 - 1) / 4096) * 4096; // need to round up to min write size
+        if (lz4_bytes < io_u->buflen-3) { // Data is smaller than original
+            scratchbuf[1] = lz4_bytes >> 8;
+            scratchbuf[0] = lz4_bytes & 0xFF;
+            scratchbuf[2] = 0xDE;
+            scratchbuf[3] = 0xC0;
+        } else {
+            scratchbuf[1] = lz4_bytes >> 8;
+            scratchbuf[0] = lz4_bytes & 0xFF;
+            scratchbuf[2] = 0xAD;
+            scratchbuf[3] = 0xDE;
+        }
+        memcpy(io_u->buf, scratchbuf, io_u->buflen);
+        io_u->buflen = lz4_bytes;
+    }
+
+    free(scratchbuf);
+    return;
+}
+
+void do_decompress_lz(struct io_u *io_u)
+{
+    int lz4_bytes;
+    char* scratchbuf = calloc(io_u->xfer_buflen, sizeof(char));
+
+    memcpy(scratchbuf, io_u->xfer_buf, io_u->xfer_buflen);
+    lz4_bytes = scratchbuf[0] & (scratchbuf[1] << 8);
+
+    if (scratchbuf && lz4_bytes) {
+        LZ4_decompress_safe(scratchbuf, io_u->xfer_buf, lz4_bytes, io_u->xfer_buflen);
+    }
+
+    free(scratchbuf);
+    return;
+}
+
 /*
  * Return an io_u to be processed. Gets a buflen and offset, sets direction,
  * etc. The returned io_u is fully ready to be prepped, populated and submitted.
@@ -1815,9 +1859,6 @@ struct io_u *get_io_u(struct thread_data *td)
 			goto err_put;
 		}
 
-		f->last_start[io_u->ddir] = io_u->offset;
-		f->last_pos[io_u->ddir] = io_u->offset + io_u->buflen;
-
 		if (io_u->ddir == DDIR_WRITE) {
 			if (td->flags & TD_F_REFILL_BUFFERS) {
 				io_u_fill_buffer(td, io_u,
@@ -1827,6 +1868,12 @@ struct io_u *get_io_u(struct thread_data *td)
 				   !(td->flags & TD_F_COMPRESS) &&
 				   !(td->flags & TD_F_DO_VERIFY))
 				do_scramble = 1;
+			 /*
+                         * Add option to compress the IO and set a new data size
+                         */
+                        if (td->o.compress_test) {
+                           do_compress_lz(io_u, td->o.min_bs[DDIR_WRITE]);
+                        }
 		} else if (io_u->ddir == DDIR_READ) {
 			/*
 			 * Reset the buf_filled parameters so next time if the
@@ -1834,6 +1881,9 @@ struct io_u *get_io_u(struct thread_data *td)
 			 */
 			io_u->buf_filled_len = 0;
 		}
+
+		f->last_start[io_u->ddir] = io_u->offset;
+		f->last_pos[io_u->ddir] = io_u->offset + io_u->buflen;
 	}
 
 	/*

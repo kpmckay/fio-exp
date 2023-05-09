@@ -340,6 +340,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->trim_backlog = le64_to_cpu(top->trim_backlog);
 	o->rate_process = le32_to_cpu(top->rate_process);
 	o->rate_ign_think = le32_to_cpu(top->rate_ign_think);
+	o->compress_test = le32_to_cpu(top->compress_test);
 
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		o->percentile_list[i].u.f = fio_uint64_to_double(le64_to_cpu(top->percentile_list[i].u.i));
