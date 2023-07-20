@@ -627,7 +627,9 @@ generated filenames (with a directory specified) with the source of the
 client connecting. To disable this behavior, set this option to 0.
 .TP
 .BI opendir \fR=\fPstr
-Recursively open any files below directory \fIstr\fR.
+Recursively open any files below directory \fIstr\fR. This accepts only a
+single directory and unlike related options, colons appearing in the path must
+not be escaped.
 .TP
 .BI lockfile \fR=\fPstr
 Fio defaults to not locking any files before it does I/O to them. If a file
@@ -830,18 +832,30 @@ numbers fio only reads beyond the write pointer if explicitly told to do
 so. Default: false.
 .TP
 .BI max_open_zones \fR=\fPint
-A zone of a zoned block device is in the open state when it is partially written
-(i.e. not all sectors of the zone have been written). Zoned block devices may
-have limit a on the total number of zones that can be simultaneously in the
-open state, that is, the number of zones that can be written to simultaneously.
-The \fBmax_open_zones\fR parameter limits the number of zones to which write
-commands are issued by all fio jobs, that is, limits the number of zones that
-will be in the open state. This parameter is relevant only if the
-\fBzonemode=zbd\fR is used. The default value is always equal to maximum number
-of open zones of the target zoned block device and a value higher than this
-limit cannot be specified by users unless the option \fBignore_zone_limits\fR is
-specified. When \fBignore_zone_limits\fR is specified or the target device has
-no limit on the number of zones that can be in an open state,
+When a zone of a zoned block device is partially written (i.e. not all sectors
+of the zone have been written), the zone is in one of three
+conditions: 'implicit open', 'explicit open' or 'closed'. Zoned block devices
+may have a limit called 'max_open_zones' (same name as the parameter) on the
+total number of zones that can simultaneously be in the 'implicit open'
+or 'explicit open' conditions. Zoned block devices may have another limit
+called 'max_active_zones', on the total number of zones that can simultaneously
+be in the three conditions. The \fBmax_open_zones\fR parameter limits
+the number of zones to which write commands are issued by all fio jobs, that is,
+limits the number of zones that will be in the conditions. When the device has
+the max_open_zones limit and does not have the max_active_zones limit, the
+\fBmax_open_zones\fR parameter limits the number of zones in the two open
+conditions up to the limit. In this case, fio includes zones in the two open
+conditions to the write target zones at fio start. When the device has both the
+max_open_zones and the max_active_zones limits, the \fBmax_open_zones\fR
+parameter limits the number of zones in the three conditions up to the limit.
+In this case, fio includes zones in the three conditions to the write target
+zones at fio start.
+
+This parameter is relevant only if the \fBzonemode=zbd\fR is used. The default
+value is always equal to the max_open_zones limit of the target zoned block
+device and a value higher than this limit cannot be specified by users unless
+the option \fBignore_zone_limits\fR is specified. When \fBignore_zone_limits\fR
+is specified or the target device does not have the max_open_zones limit,
 \fBmax_open_zones\fR can specify 0 to disable any limit on the number of zones
 that can be simultaneously written to by all jobs.
 .TP
@@ -2190,10 +2204,26 @@ cached data. Currently the RWF_NOWAIT flag does not supported for cached write.
 For direct I/O, requests will only succeed if cache invalidation isn't required,
 file blocks are fully allocated and the disk request could be issued immediately.
 .TP
-.BI (io_uring_cmd)fdp \fR=\fPbool
+.BI (io_uring_cmd,xnvme)fdp \fR=\fPbool
 Enable Flexible Data Placement mode for write commands.
 .TP
-.BI (io_uring_cmd)fdp_pli \fR=\fPstr
+.BI (io_uring_cmd,xnvme)fdp_pli_select \fR=\fPstr
+Defines how fio decides which placement ID to use next. The following types
+are defined:
+.RS
+.RS
+.TP
+.B random
+Choose a placement ID at random (uniform).
+.TP
+.B roundrobin
+Round robin over available placement IDs. This is the default.
+.RE
+.P
+The available placement ID index/indices is defined by \fBfdp_pli\fR option.
+.RE
+.TP
+.BI (io_uring_cmd,xnvme)fdp_pli \fR=\fPstr
 Select which Placement ID Index/Indicies this job is allowed to use for writes.
 By default, the job will cycle through all available Placement IDs, so use this
 to isolate these identifiers to specific jobs. If you want fio to use placement
@@ -2765,6 +2795,9 @@ Use a busy loop with a non-blocking call to \fBblkioq_do_io()\fR.
 Enable the queue's completion eventfd even when unused. This may impact
 performance. The default is to enable it only if
 \fBlibblkio_wait_mode=eventfd\fR.
+.TP
+.BI (windowsaio)no_completion_thread
+Avoid using a separate thread for completion polling.
 .SS "I/O depth"
 .TP
 .BI iodepth \fR=\fPint
@@ -2946,6 +2979,10 @@ By default, fio will attempt to catch up to the specified rate setting, if any
 kind of thinktime setting was used. If this option is set, then fio will
 ignore the thinktime and continue doing IO at the specified rate, instead of
 entering a catch-up mode after thinktime is done.
+.TP
+.BI rate_cycle \fR=\fPint
+Average bandwidth for \fBrate\fR and \fBrate_min\fR over this number
+of milliseconds. Defaults to 1000.
 .SS "I/O latency"
 .TP
 .BI latency_target \fR=\fPtime
@@ -2975,10 +3012,6 @@ If set, fio will exit the job with an ETIMEDOUT error if it exceeds this
 maximum latency. When the unit is omitted, the value is interpreted in
 microseconds. Comma-separated values may be specified for reads, writes,
 and trims as described in \fBblocksize\fR.
-.TP
-.BI rate_cycle \fR=\fPint
-Average bandwidth for \fBrate\fR and \fBrate_min\fR over this number
-of milliseconds. Defaults to 1000.
 .SS "I/O replay"
 .TP
 .BI write_iolog \fR=\fPstr
@@ -3475,6 +3508,11 @@ far it should verify. Without this information, fio will run a full
 verification pass, according to the settings in the job file used. Default
 false.
 .TP
+.BI experimental_verify \fR=\fPbool
+Enable experimental verification. Standard verify records I/O metadata for
+later use during the verification phase. Experimental verify instead resets the
+file after the write phase and then replays I/Os for the verification phase.
+.TP
 .BI trim_percentage \fR=\fPint
 Number of verify blocks to discard/trim.
 .TP
@@ -3486,11 +3524,6 @@ Verify that trim/discarded blocks are returned as zeros.
 .TP
 .BI trim_backlog_batch \fR=\fPint
 Trim this number of I/O blocks.
-.TP
-.BI experimental_verify \fR=\fPbool
-Enable experimental verification. Standard verify records I/O metadata for
-later use during the verification phase. Experimental verify instead resets the
-file after the write phase and then replays I/Os for the verification phase.
 .SS "Steady state"
 .TP
 .BI steadystate \fR=\fPstr:float "\fR,\fP ss" \fR=\fPstr:float
@@ -4073,15 +4106,20 @@ Total latency. Same names as slat and clat, this denotes the time from
 when fio created the I/O unit to completion of the I/O operation.
 .TP
 .B bw
-Bandwidth statistics based on samples. Same names as the xlat stats,
-but also includes the number of samples taken (\fIsamples\fR) and an
-approximate percentage of total aggregate bandwidth this thread
-received in its group (\fIper\fR). This last value is only really
-useful if the threads in this group are on the same disk, since they
-are then competing for disk access.
+Bandwidth statistics based on measurements from discrete intervals. Fio
+continuosly monitors bytes transferred and I/O operations completed. By default
+fio calculates bandwidth in each half-second interval (see \fBbwavgtime\fR)
+and reports descriptive statistics for the measurements here. Same names as the
+xlat stats, but also includes the number of samples taken (\fIsamples\fR) and an
+approximate percentage of total aggregate bandwidth this thread received in its
+group (\fIper\fR). This last value is only really useful if the threads in this
+group are on the same disk, since they are then competing for disk access.
 .TP
 .B iops
-IOPS statistics based on samples. Same names as \fBbw\fR.
+IOPS statistics based on measurements from discrete intervals.
+For details see the description for \fBbw\fR above. See
+\fBiopsavgtime\fR to control the duration of the intervals.
+Same values reported here as for \fBbw\fR except for percentage.
 .TP
 .B lat (nsec/usec/msec)
 The distribution of I/O completion latencies. This is the time from when
@@ -4158,7 +4196,7 @@ They will look like this:
 .P
 .nf
 		  Disk stats (read/write):
-		    sda: ios=16398/16511, merge=30/162, ticks=6853/819634, in_queue=826487, util=100.00%
+		    sda: ios=16398/16511, sectors=32321/65472, merge=30/162, ticks=6853/819634, in_queue=826487, util=100.00%
 .fi
 .P
 Each value is printed for both reads and writes, with reads first. The

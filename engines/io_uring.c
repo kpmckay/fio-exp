@@ -78,6 +78,8 @@ struct ioring_data {
 	struct ioring_mmap mmap[3];
 
 	struct cmdprio cmdprio;
+
+	struct nvme_dsm_range *dsm;
 };
 
 struct ioring_options {
@@ -410,7 +412,7 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 	if (o->cmd_type != FIO_URING_CMD_NVME)
 		return -EINVAL;
 
-	if (io_u->ddir == DDIR_TRIM)
+	if (io_u->ddir == DDIR_TRIM && td->io_ops->flags & FIO_ASYNCIO_SYNC_TRIM)
 		return 0;
 
 	sqe = &ld->sqes[(io_u->index) << 1];
@@ -444,7 +446,8 @@ static int fio_ioring_cmd_prep(struct thread_data *td, struct io_u *io_u)
 
 	cmd = (struct nvme_uring_cmd *)sqe->cmd;
 	return fio_nvme_uring_cmd_prep(cmd, io_u,
-			o->nonvectored ? NULL : &ld->iovecs[io_u->index]);
+			o->nonvectored ? NULL : &ld->iovecs[io_u->index],
+			&ld->dsm[io_u->index]);
 }
 
 static struct io_u *fio_ioring_event(struct thread_data *td, int event)
@@ -561,27 +564,6 @@ static inline void fio_ioring_cmdprio_prep(struct thread_data *td,
 		ld->sqes[io_u->index].ioprio = io_u->ioprio;
 }
 
-static int fio_ioring_cmd_io_u_trim(const struct thread_data *td,
-				    struct io_u *io_u)
-{
-	struct fio_file *f = io_u->file;
-	int ret;
-
-	if (td->o.zone_mode == ZONE_MODE_ZBD) {
-		ret = zbd_do_io_u_trim(td, io_u);
-		if (ret == io_u_completed)
-			return io_u->xfer_buflen;
-		if (ret)
-			goto err;
-	}
-
-	return fio_nvme_trim(td, f, io_u->offset, io_u->xfer_buflen);
-
-err:
-	io_u->error = ret;
-	return 0;
-}
-
 static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 					  struct io_u *io_u)
 {
@@ -594,14 +576,11 @@ static enum fio_q_status fio_ioring_queue(struct thread_data *td,
 	if (ld->queued == ld->iodepth)
 		return FIO_Q_BUSY;
 
-	if (io_u->ddir == DDIR_TRIM) {
+	if (io_u->ddir == DDIR_TRIM && td->io_ops->flags & FIO_ASYNCIO_SYNC_TRIM) {
 		if (ld->queued)
 			return FIO_Q_BUSY;
 
-		if (!strcmp(td->io_ops->name, "io_uring_cmd"))
-			fio_ioring_cmd_io_u_trim(td, io_u);
-		else
-			do_io_u_trim(td, io_u);
+		do_io_u_trim(td, io_u);
 
 		io_u_mark_submit(td, 1);
 		io_u_mark_complete(td, 1);
@@ -667,7 +646,7 @@ static int fio_ioring_commit(struct thread_data *td)
 	 */
 	if (o->sqpoll_thread) {
 		struct io_sq_ring *ring = &ld->sq_ring;
-		unsigned start = *ld->sq_ring.head;
+		unsigned start = *ld->sq_ring.tail - ld->queued;
 		unsigned flags;
 
 		flags = atomic_load_acquire(ring->flags);
@@ -734,6 +713,7 @@ static void fio_ioring_cleanup(struct thread_data *td)
 		free(ld->io_u_index);
 		free(ld->iovecs);
 		free(ld->fds);
+		free(ld->dsm);
 		free(ld);
 	}
 }
@@ -1146,6 +1126,16 @@ static int fio_ioring_init(struct thread_data *td)
 		return 1;
 	}
 
+	/*
+	 * For io_uring_cmd, trims are async operations unless we are operating
+	 * in zbd mode where trim means zone reset.
+	 */
+	if (!strcmp(td->io_ops->name, "io_uring_cmd") && td_trim(td) &&
+	    td->o.zone_mode == ZONE_MODE_ZBD)
+		td->io_ops->flags |= FIO_ASYNCIO_SYNC_TRIM;
+	else
+		ld->dsm = calloc(ld->iodepth, sizeof(*ld->dsm));
+
 	return 0;
 }
 
@@ -1177,22 +1167,41 @@ static int fio_ioring_cmd_open_file(struct thread_data *td, struct fio_file *f)
 	if (o->cmd_type == FIO_URING_CMD_NVME) {
 		struct nvme_data *data = NULL;
 		unsigned int nsid, lba_size = 0;
+		__u32 ms = 0;
 		__u64 nlba = 0;
 		int ret;
 
 		/* Store the namespace-id and lba size. */
 		data = FILE_ENG_DATA(f);
 		if (data == NULL) {
-			ret = fio_nvme_get_info(f, &nsid, &lba_size, &nlba);
+			ret = fio_nvme_get_info(f, &nsid, &lba_size, &ms, &nlba);
 			if (ret)
 				return ret;
 
 			data = calloc(1, sizeof(struct nvme_data));
 			data->nsid = nsid;
-			data->lba_shift = ilog2(lba_size);
+			if (ms)
+				data->lba_ext = lba_size + ms;
+			else
+				data->lba_shift = ilog2(lba_size);
 
 			FILE_SET_ENG_DATA(f, data);
 		}
+
+		assert(data->lba_shift < 32);
+		lba_size = data->lba_ext ? data->lba_ext : (1U << data->lba_shift);
+
+		for_each_rw_ddir(ddir) {
+			if (td->o.min_bs[ddir] % lba_size ||
+				td->o.max_bs[ddir] % lba_size) {
+				if (data->lba_ext)
+					log_err("block size must be a multiple of "
+						"(LBA data size + Metadata size)\n");
+				else
+					log_err("block size must be a multiple of LBA data size\n");
+				return 1;
+			}
+                }
 	}
 	if (!ld || !o->registerfiles)
 		return generic_open_file(td, f);
@@ -1243,16 +1252,20 @@ static int fio_ioring_cmd_get_file_size(struct thread_data *td,
 	if (o->cmd_type == FIO_URING_CMD_NVME) {
 		struct nvme_data *data = NULL;
 		unsigned int nsid, lba_size = 0;
+		__u32 ms = 0;
 		__u64 nlba = 0;
 		int ret;
 
-		ret = fio_nvme_get_info(f, &nsid, &lba_size, &nlba);
+		ret = fio_nvme_get_info(f, &nsid, &lba_size, &ms, &nlba);
 		if (ret)
 			return ret;
 
 		data = calloc(1, sizeof(struct nvme_data));
 		data->nsid = nsid;
-		data->lba_shift = ilog2(lba_size);
+		if (ms)
+			data->lba_ext = lba_size + ms;
+		else
+			data->lba_shift = ilog2(lba_size);
 
 		f->real_file_size = lba_size * nlba;
 		fio_file_set_size_known(f);
@@ -1297,7 +1310,7 @@ static int fio_ioring_cmd_fetch_ruhs(struct thread_data *td, struct fio_file *f,
 	struct nvme_fdp_ruh_status *ruhs;
 	int bytes, ret, i;
 
-	bytes = sizeof(*ruhs) + 128 * sizeof(struct nvme_fdp_ruh_status_desc);
+	bytes = sizeof(*ruhs) + FDP_MAX_RUHS * sizeof(struct nvme_fdp_ruh_status_desc);
 	ruhs = scalloc(1, bytes);
 	if (!ruhs)
 		return -ENOMEM;
@@ -1338,8 +1351,7 @@ static struct ioengine_ops ioengine_uring = {
 static struct ioengine_ops ioengine_uring_cmd = {
 	.name			= "io_uring_cmd",
 	.version		= FIO_IOOPS_VERSION,
-	.flags			= FIO_ASYNCIO_SYNC_TRIM | FIO_NO_OFFLOAD |
-					FIO_MEMALIGN | FIO_RAWIO |
+	.flags			= FIO_NO_OFFLOAD | FIO_MEMALIGN | FIO_RAWIO |
 					FIO_ASYNCIO_SETS_ISSUE_TIME,
 	.init			= fio_ioring_init,
 	.post_init		= fio_ioring_cmd_post_init,

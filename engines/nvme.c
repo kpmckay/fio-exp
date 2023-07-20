@@ -5,8 +5,41 @@
 
 #include "nvme.h"
 
+static inline __u64 get_slba(struct nvme_data *data, struct io_u *io_u)
+{
+	if (data->lba_ext)
+		return io_u->offset / data->lba_ext;
+	else
+		return io_u->offset >> data->lba_shift;
+}
+
+static inline __u32 get_nlb(struct nvme_data *data, struct io_u *io_u)
+{
+	if (data->lba_ext)
+		return io_u->xfer_buflen / data->lba_ext - 1;
+	else
+		return (io_u->xfer_buflen >> data->lba_shift) - 1;
+}
+
+void fio_nvme_uring_cmd_trim_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
+				  struct nvme_dsm_range *dsm)
+{
+	struct nvme_data *data = FILE_ENG_DATA(io_u->file);
+
+	cmd->opcode = nvme_cmd_dsm;
+	cmd->nsid = data->nsid;
+	cmd->cdw10 = 0;
+	cmd->cdw11 = NVME_ATTRIBUTE_DEALLOCATE;
+	cmd->addr = (__u64) (uintptr_t) dsm;
+	cmd->data_len = sizeof(*dsm);
+
+	dsm->slba = get_slba(data, io_u);
+	/* nlb is a 1-based value for deallocate */
+	dsm->nlb = get_nlb(data, io_u) + 1;
+}
+
 int fio_nvme_uring_cmd_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
-			    struct iovec *iov)
+			    struct iovec *iov, struct nvme_dsm_range *dsm)
 {
 	struct nvme_data *data = FILE_ENG_DATA(io_u->file);
 	__u64 slba;
@@ -14,15 +47,22 @@ int fio_nvme_uring_cmd_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 
 	memset(cmd, 0, sizeof(struct nvme_uring_cmd));
 
-	if (io_u->ddir == DDIR_READ)
+	switch (io_u->ddir) {
+	case DDIR_READ:
 		cmd->opcode = nvme_cmd_read;
-	else if (io_u->ddir == DDIR_WRITE)
+		break;
+	case DDIR_WRITE:
 		cmd->opcode = nvme_cmd_write;
-	else
+		break;
+	case DDIR_TRIM:
+		fio_nvme_uring_cmd_trim_prep(cmd, io_u, dsm);
+		return 0;
+	default:
 		return -ENOTSUP;
+	}
 
-	slba = io_u->offset >> data->lba_shift;
-	nlb = (io_u->xfer_buflen >> data->lba_shift) - 1;
+	slba = get_slba(data, io_u);
+	nlb = get_nlb(data, io_u);
 
 	/* cdw10 and cdw11 represent starting lba */
 	cmd->cdw10 = slba & 0xffffffff;
@@ -43,40 +83,6 @@ int fio_nvme_uring_cmd_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 	return 0;
 }
 
-static int nvme_trim(int fd, __u32 nsid, __u32 nr_range, __u32 data_len,
-		     void *data)
-{
-	struct nvme_passthru_cmd cmd = {
-		.opcode		= nvme_cmd_dsm,
-		.nsid		= nsid,
-		.addr		= (__u64)(uintptr_t)data,
-		.data_len 	= data_len,
-		.cdw10		= nr_range - 1,
-		.cdw11		= NVME_ATTRIBUTE_DEALLOCATE,
-	};
-
-	return ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
-}
-
-int fio_nvme_trim(const struct thread_data *td, struct fio_file *f,
-		  unsigned long long offset, unsigned long long len)
-{
-	struct nvme_data *data = FILE_ENG_DATA(f);
-	struct nvme_dsm_range dsm;
-	int ret;
-
-	dsm.nlb = (len >> data->lba_shift);
-	dsm.slba = (offset >> data->lba_shift);
-
-	ret = nvme_trim(f->fd, data->nsid, 1, sizeof(struct nvme_dsm_range),
-			&dsm);
-	if (ret)
-		log_err("%s: nvme_trim failed for offset %llu and len %llu, err=%d\n",
-			f->file_name, offset, len, ret);
-
-	return ret;
-}
-
 static int nvme_identify(int fd, __u32 nsid, enum nvme_identify_cns cns,
 			 enum nvme_csi csi, void *data)
 {
@@ -94,11 +100,12 @@ static int nvme_identify(int fd, __u32 nsid, enum nvme_identify_cns cns,
 }
 
 int fio_nvme_get_info(struct fio_file *f, __u32 *nsid, __u32 *lba_sz,
-		      __u64 *nlba)
+		      __u32 *ms, __u64 *nlba)
 {
 	struct nvme_id_ns ns;
 	int namespace_id;
 	int fd, err;
+	__u32 format_idx;
 
 	if (f->filetype != FIO_TYPE_CHAR) {
 		log_err("ioengine io_uring_cmd only works with nvme ns "
@@ -113,9 +120,8 @@ int fio_nvme_get_info(struct fio_file *f, __u32 *nsid, __u32 *lba_sz,
 	namespace_id = ioctl(fd, NVME_IOCTL_ID);
 	if (namespace_id < 0) {
 		err = -errno;
-		log_err("failed to fetch namespace-id");
-		close(fd);
-		return err;
+		log_err("%s: failed to fetch namespace-id\n", f->file_name);
+		goto out;
 	}
 
 	/*
@@ -125,17 +131,51 @@ int fio_nvme_get_info(struct fio_file *f, __u32 *nsid, __u32 *lba_sz,
 	err = nvme_identify(fd, namespace_id, NVME_IDENTIFY_CNS_NS,
 				NVME_CSI_NVM, &ns);
 	if (err) {
-		log_err("failed to fetch identify namespace\n");
+		log_err("%s: failed to fetch identify namespace\n",
+			f->file_name);
 		close(fd);
 		return err;
 	}
 
 	*nsid = namespace_id;
-	*lba_sz = 1 << ns.lbaf[(ns.flbas & 0x0f)].ds;
+
+	/*
+	 * 16 or 64 as maximum number of supported LBA formats.
+	 * From flbas bit 0-3 indicates lsb and bit 5-6 indicates msb
+	 * of the format index used to format the namespace.
+	 */
+	if (ns.nlbaf < 16)
+		format_idx = ns.flbas & 0xf;
+	else
+		format_idx = (ns.flbas & 0xf) + (((ns.flbas >> 5) & 0x3) << 4);
+
+	*lba_sz = 1 << ns.lbaf[format_idx].ds;
+
+	/*
+	 * Only extended LBA can be supported.
+	 * Bit 4 for flbas indicates if metadata is transferred at the end of
+	 * logical block creating an extended LBA.
+	 */
+	*ms = le16_to_cpu(ns.lbaf[format_idx].ms);
+	if (*ms && !((ns.flbas >> 4) & 0x1)) {
+		log_err("%s: only extended logical block can be supported\n",
+			f->file_name);
+		err = -ENOTSUP;
+		goto out;
+	}
+
+	/* Check for end to end data protection support */
+	if (ns.dps & 0x3) {
+		log_err("%s: end to end data protection not supported\n",
+			f->file_name);
+		err = -ENOTSUP;
+		goto out;
+	}
 	*nlba = ns.nsze;
 
+out:
 	close(fd);
-	return 0;
+	return err;
 }
 
 int fio_nvme_get_zoned_model(struct thread_data *td, struct fio_file *f,

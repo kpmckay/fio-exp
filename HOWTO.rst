@@ -843,7 +843,9 @@ Target file/device
 
 .. option:: opendir=str
 
-	Recursively open any files below directory `str`.
+        Recursively open any files below directory `str`. This accepts only a
+        single directory and unlike related options, colons appearing in the
+        path must not be escaped.
 
 .. option:: lockfile=str
 
@@ -1054,22 +1056,34 @@ Target file/device
 
 .. option:: max_open_zones=int
 
-	A zone of a zoned block device is in the open state when it is partially
-	written (i.e. not all sectors of the zone have been written). Zoned
-	block devices may have a limit on the total number of zones that can
-	be simultaneously in the open state, that is, the number of zones that
-	can be written to simultaneously. The :option:`max_open_zones` parameter
-	limits the number of zones to which write commands are issued by all fio
-	jobs, that is, limits the number of zones that will be in the open
-	state. This parameter is relevant only if the :option:`zonemode` =zbd is
-	used. The default value is always equal to maximum number of open zones
-	of the target zoned block device and a value higher than this limit
-	cannot be specified by users unless the option
-	:option:`ignore_zone_limits` is specified. When
-	:option:`ignore_zone_limits` is specified or the target device has no
-	limit on the number of zones that can be in an open state,
-	:option:`max_open_zones` can specify 0 to disable any limit on the
-	number of zones that can be simultaneously written to by all jobs.
+	When a zone of a zoned block device is partially written (i.e. not all
+	sectors of the zone have been written), the zone is in one of three
+	conditions: 'implicit open', 'explicit open' or 'closed'. Zoned block
+	devices may have a limit called 'max_open_zones' (same name as the
+	parameter) on the total number of zones that can simultaneously be in
+	the 'implicit open' or 'explicit open' conditions. Zoned block devices
+	may have another limit called 'max_active_zones', on the total number of
+	zones that can simultaneously be in the three conditions. The
+	:option:`max_open_zones` parameter limits the number of zones to which
+	write commands are issued by all fio jobs, that is, limits the number of
+	zones that will be in the conditions. When the device has the
+	max_open_zones limit and does not have the max_active_zones limit, the
+	:option:`max_open_zones` parameter limits the number of zones in the two
+	open conditions up to the limit. In this case, fio includes zones in the
+	two open conditions to the write target zones at fio start. When the
+	device has both the max_open_zones and the max_active_zones limits, the
+	:option:`max_open_zones` parameter limits the number of zones in the
+	three conditions up to the limit. In this case, fio includes zones in
+	the three conditions to the write target zones at fio start.
+
+	This parameter is relevant only if the :option:`zonemode` =zbd is used.
+	The default value is always equal to the max_open_zones limit of the
+	target zoned block device and a value higher than this limit cannot be
+	specified by users unless the option :option:`ignore_zone_limits` is
+	specified. When :option:`ignore_zone_limits` is specified or the target
+	device does not have the max_open_zones limit, :option:`max_open_zones`
+	can specify 0 to disable any limit on the number of zones that can be
+	simultaneously written to by all jobs.
 
 .. option:: job_max_open_zones=int
 
@@ -2429,11 +2443,26 @@ with the caveat that when used on the command line, they must come after the
 	For direct I/O, requests will only succeed if cache invalidation isn't required,
 	file blocks are fully allocated and the disk request could be issued immediately.
 
-.. option:: fdp=bool : [io_uring_cmd]
+.. option:: fdp=bool : [io_uring_cmd] [xnvme]
 
 	Enable Flexible Data Placement mode for write commands.
 
-.. option:: fdp_pli=str : [io_uring_cmd]
+.. option:: fdp_pli_select=str : [io_uring_cmd] [xnvme]
+
+	Defines how fio decides which placement ID to use next. The following
+	types are defined:
+
+		**random**
+			Choose a placement ID at random (uniform).
+
+		**roundrobin**
+			Round robin over available placement IDs. This is the
+			default.
+
+	The available placement ID index/indices is defined by the option
+	:option:`fdp_pli`.
+
+.. option:: fdp_pli=str : [io_uring_cmd] [xnvme]
 
 	Select which Placement ID Index/Indicies this job is allowed to use for
 	writes. By default, the job will cycle through all available Placement
@@ -3011,6 +3040,10 @@ with the caveat that when used on the command line, they must come after the
 	performance. The default is to enable it only if
 	:option:`libblkio_wait_mode=eventfd <libblkio_wait_mode>`.
 
+.. option:: no_completion_thread : [windowsaio]
+
+	Avoid using a separate thread for completion polling.
+
 I/O depth
 ~~~~~~~~~
 
@@ -3203,6 +3236,11 @@ I/O rate
 	fio will ignore the thinktime and continue doing IO at the specified
 	rate, instead of entering a catch-up mode after thinktime is done.
 
+.. option:: rate_cycle=int
+
+	Average bandwidth for :option:`rate` and :option:`rate_min` over this number
+	of milliseconds. Defaults to 1000.
+
 
 I/O latency
 ~~~~~~~~~~~
@@ -3240,11 +3278,6 @@ I/O latency
 	maximum latency. When the unit is omitted, the value is interpreted in
 	microseconds. Comma-separated values may be specified for reads, writes,
 	and trims as described in :option:`blocksize`.
-
-.. option:: rate_cycle=int
-
-	Average bandwidth for :option:`rate` and :option:`rate_min` over this number
-	of milliseconds. Defaults to 1000.
 
 
 I/O replay
@@ -3761,6 +3794,13 @@ Verification
 	verification pass, according to the settings in the job file used.  Default
 	false.
 
+.. option:: experimental_verify=bool
+
+        Enable experimental verification. Standard verify records I/O metadata
+        for later use during the verification phase. Experimental verify
+        instead resets the file after the write phase and then replays I/Os for
+        the verification phase.
+
 .. option:: trim_percentage=int
 
 	Number of verify blocks to discard/trim.
@@ -3776,13 +3816,6 @@ Verification
 .. option:: trim_backlog_batch=int
 
 	Trim this number of I/O blocks.
-
-.. option:: experimental_verify=bool
-
-        Enable experimental verification. Standard verify records I/O metadata
-        for later use during the verification phase. Experimental verify
-        instead resets the file after the write phase and then replays I/Os for
-        the verification phase.
 
 Steady state
 ~~~~~~~~~~~~
@@ -4417,15 +4450,23 @@ writes in the example above).  In the order listed, they denote:
                 It is the sum of submission and completion latency.
 
 **bw**
-		Bandwidth statistics based on samples. Same names as the xlat stats,
-		but also includes the number of samples taken (**samples**) and an
-		approximate percentage of total aggregate bandwidth this thread
-		received in its group (**per**). This last value is only really
-		useful if the threads in this group are on the same disk, since they
-		are then competing for disk access.
+		Bandwidth statistics based on measurements from discrete
+		intervals. Fio continuously monitors bytes transferred and I/O
+		operations completed. By default fio calculates bandwidth in
+		each half-second interval (see :option:`bwavgtime`) and reports
+		descriptive statistics for the measurements here. Same names as
+		the xlat stats, but also includes the number of samples taken
+		(**samples**) and an approximate percentage of total aggregate
+		bandwidth this thread received in its group (**per**). This
+		last value is only really useful if the threads in this group
+		are on the same disk, since they are then competing for disk
+		access.
 
 **iops**
-		IOPS statistics based on samples. Same names as bw.
+		IOPS statistics based on measurements from discrete intervals.
+		For details see the description for bw above. See
+		:option:`iopsavgtime` to control the duration of the intervals.
+		Same values reported here as for bw except for percentage.
 
 **lat (nsec/usec/msec)**
 		The distribution of I/O completion latencies. This is the time from when
@@ -4499,13 +4540,15 @@ For each data direction it prints:
 And finally, the disk statistics are printed. This is Linux specific. They will look like this::
 
   Disk stats (read/write):
-    sda: ios=16398/16511, merge=30/162, ticks=6853/819634, in_queue=826487, util=100.00%
+    sda: ios=16398/16511, sectors=32321/65472, merge=30/162, ticks=6853/819634, in_queue=826487, util=100.00%
 
 Each value is printed for both reads and writes, with reads first. The
 numbers denote:
 
 **ios**
 		Number of I/Os performed by all groups.
+**sectors**
+		Amount of data transferred in units of 512 bytes for all groups.
 **merge**
 		Number of merges performed by the I/O scheduler.
 **ticks**

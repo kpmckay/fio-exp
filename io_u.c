@@ -1614,7 +1614,6 @@ struct io_u *__get_io_u(struct thread_data *td)
 {
 	const bool needs_lock = td_async_processing(td);
 	struct io_u *io_u = NULL;
-	int ret;
 
 	if (td->stop_io)
 		return NULL;
@@ -1648,14 +1647,16 @@ again:
 		io_u_set(td, io_u, IO_U_F_IN_CUR_DEPTH);
 		io_u->ipo = NULL;
 	} else if (td_async_processing(td)) {
+		int ret;
 		/*
 		 * We ran out, wait for async verify threads to finish and
 		 * return one
 		 */
 		assert(!(td->flags & TD_F_CHILD));
 		ret = pthread_cond_wait(&td->free_cond, &td->io_u_lock);
-		assert(ret == 0);
-		if (!td->error)
+		if (fio_unlikely(ret != 0)) {
+			td->error = errno;
+		} else if (!td->error)
 			goto again;
 	}
 
@@ -1928,6 +1929,8 @@ static void __io_u_log_error(struct thread_data *td, struct io_u *io_u)
 		io_ddir_name(io_u->ddir),
 		io_u->offset, io_u->xfer_buflen);
 
+	zbd_log_err(td, io_u);
+
 	if (td->io_ops->errdetails) {
 		char *err = td->io_ops->errdetails(io_u);
 
@@ -2077,6 +2080,8 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 	}
 
 	if (ddir_sync(ddir)) {
+		if (io_u->error)
+			goto error;
 		td->last_was_sync = true;
 		if (f) {
 			f->first_write = -1ULL;
@@ -2132,6 +2137,7 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 				icd->error = ret;
 		}
 	} else if (io_u->error) {
+error:
 		icd->error = io_u->error;
 		io_u_log_error(td, io_u);
 	}
@@ -2426,7 +2432,7 @@ int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
 	return ret;
 }
 
-int do_io_u_trim(const struct thread_data *td, struct io_u *io_u)
+int do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 {
 #ifndef FIO_HAVE_TRIM
 	io_u->error = EINVAL;

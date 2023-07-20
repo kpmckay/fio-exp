@@ -897,7 +897,16 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 	if (left)
 		total = usec_spin(left);
 
-	left = td->o.thinktime - total;
+	/*
+	 * usec_spin() might run for slightly longer than intended in a VM
+	 * where the vCPU could get descheduled or the hypervisor could steal
+	 * CPU time. Ensure "left" doesn't become negative.
+	 */
+	if (total < td->o.thinktime)
+		left = td->o.thinktime - total;
+	else
+		left = 0;
+
 	if (td->o.timeout) {
 		runtime_left = td->o.timeout - utime_since_now(&td->epoch);
 		if (runtime_left < (unsigned long long)left)
@@ -1633,7 +1642,7 @@ static void *thread_main(void *data)
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
 	int deadlock_loop_cnt;
 	bool clear_state;
-	int res, ret;
+	int ret;
 
 	sk_out_assign(sk_out);
 	free(fd);
@@ -1974,13 +1983,23 @@ static void *thread_main(void *data)
 	 * another thread is checking its io_u's for overlap
 	 */
 	if (td_offload_overlap(td)) {
-		int res = pthread_mutex_lock(&overlap_check);
-		assert(res == 0);
+		int res;
+
+		res = pthread_mutex_lock(&overlap_check);
+		if (res) {
+			td->error = errno;
+			goto err;
+		}
 	}
 	td_set_runstate(td, TD_FINISHING);
 	if (td_offload_overlap(td)) {
+		int res;
+
 		res = pthread_mutex_unlock(&overlap_check);
-		assert(res == 0);
+		if (res) {
+			td->error = errno;
+			goto err;
+		}
 	}
 
 	update_rusage_stat(td);
